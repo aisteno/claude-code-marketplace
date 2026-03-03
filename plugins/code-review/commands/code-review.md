@@ -1,84 +1,121 @@
 ---
-description: Incremental, high-signal PR review with sticky state
+description: High-signal incremental PR review with continuity and severity tiers
 argument-hint: "[--comment] [owner/repo/pull/123]"
-allowed-tools: ["Bash(gh pr view:*)", "Bash(gh pr diff:*)", "Bash(gh pr comment:*)", "Bash(gh api:*)", "Bash(jq:*)", "Bash(git rev-parse:*)", "Bash(git diff:*)", "Read", "Task"]
+allowed-tools: ["Bash(gh pr view:*)", "Bash(gh pr diff:*)", "Bash(gh pr list:*)", "Bash(gh pr comment:*)", "Bash(gh api:*)", "Bash(jq:*)", "Bash(git rev-parse:*)", "Bash(git diff:*)", "Read", "Task", "mcp__github_comment__update_claude_comment"]
 ---
 
-Perform an incremental code review for a pull request with low-noise output.
+Provide an incremental code review for the given pull request.
 
-Primary goals:
-- Review only meaningful risk introduced by the latest revision when possible.
-- Avoid repeating already-addressed feedback.
-- Prefer "good enough" over nitpicks.
-- Keep feedback short and actionable.
+This command keeps Anthropic-style rigor (multi-agent + validation + todo discipline), while adding continuity across pushes and reducing repeated noise.
 
 Arguments:
 - Optional PR target: `owner/repo/pull/123`
-- Optional `--comment` flag to publish/update PR comment.
+- Optional `--comment` flag to publish/update a sticky PR review comment
+
+Agent assumptions (applies to all agents and subagents):
+- Tools are functional; do not make exploratory calls.
+- Only call tools required to complete the task.
+- False positives are worse than missing low-signal suggestions.
 
 Rules:
 1. Skip review if PR is closed or draft.
-2. Skip trivial PRs (docs/changelog/version-only changes).
-3. Never report style nits, minor refactors, or linter-only issues.
-4. Report only high-confidence issues in these buckets:
+2. Skip trivial PRs (docs/changelog/version-only changes) unless explicitly asked to review anyway.
+3. Never report style nits, minor refactors, or linter-only concerns.
+4. Report only high-confidence findings in changed code:
    - correctness bugs
    - security problems
-   - clear regressions
-   - explicit CLAUDE.md violations
+   - regressions
+   - explicit, in-scope CLAUDE.md violations
 5. If uncertain, do not report.
-6. Cap total reported issues to 5.
+6. Do not use a hard issue cap. Report all validated High/Medium findings.
 
-Incremental scope:
-1. Resolve PR target:
+Step-by-step process:
+
+1. Create and maintain a todo checklist before starting. Mark tasks done as you go.
+
+2. Resolve PR target:
    - If argument includes `owner/repo/pull/123`, use it.
-   - Else infer from current checkout/context via `gh pr view`.
-2. Determine comparison range:
-   - If this is a `synchronize` event and `before/after` SHAs exist in `GITHUB_EVENT_PATH`, review `before..after`.
-   - Else use `base.sha..head.sha` from PR metadata.
-3. Build review scope from that range and focus analysis on changed hunks in this range.
+   - Else infer from current context (`gh pr view` or provided PR metadata).
 
-Review process:
-1. Gather relevant CLAUDE.md files (root + directories of changed files).
-2. Launch two parallel agents:
-   - Agent A: high-signal bug/regression/security audit on changed hunks.
-   - Agent B: CLAUDE.md compliance audit only for scoped files.
-3. For each candidate finding, run one validation subagent to confirm it is real and in-scope.
-4. Keep only validated high-confidence findings.
+3. Determine incremental review range:
+   - If synchronize event has `before/after` SHAs in `GITHUB_EVENT_PATH`, use `before..after`.
+   - Else use `base.sha..head.sha`.
+   - Focus primary analysis on changed hunks in this range.
 
-Deduplication and continuity:
-1. Find prior Claude summary comment with marker `<!-- steno-claude-review -->`.
-2. Extract prior issue IDs from markdown checkboxes in that comment.
-3. For each current finding, generate stable ID:
-   - `ID = <path>#L<line>:<short-slug>`
-4. Classify:
-   - New Findings: IDs now present, not previously present.
-   - Still Open: IDs present now and previously present.
-   - Resolved Since Last Review: IDs previously present but not present now.
+4. Gather context:
+   - PR title/body and intent.
+   - Relevant CLAUDE.md files:
+     - root CLAUDE.md (if present)
+     - CLAUDE.md in directories containing changed files (and applicable parents)
 
-Output format (always):
+5. Run adaptive parallel review agents:
+   - For small/medium diffs: 2 parallel agents
+     - Agent A: bug/security/regression review
+     - Agent B: CLAUDE.md compliance review
+   - For larger or riskier diffs: 4 parallel agents
+     - Two CLAUDE.md compliance agents
+     - Two bug/security/regression agents
+   - Pass PR title/body context to all agents.
 
-## Incremental Review
+6. Validation pass:
+   - For every candidate finding, run a validation subagent.
+   - Keep only findings validated as real, in-scope, and high-confidence.
 
-### New Findings
+7. Assign severity tiers:
+   - High: must fix before merge (correctness break, clear security flaw, severe regression).
+   - Medium: should fix before release or within this PR if low effort.
+   - Low: optional improvement; include only if concrete, in changed code, and non-speculative.
+
+8. Continuity and deduplication:
+   - Find prior Claude sticky comment marker: `<!-- steno-claude-review -->`.
+   - Extract prior issue IDs from checklist items.
+   - Use stable issue IDs: `<path>#L<line>:<short-slug>`.
+   - Classify findings:
+     - New Findings
+     - Still Open
+     - Resolved Since Last Review
+   - Do not re-flag already-resolved findings.
+   - Prefer updating prior status over creating new noise.
+
+9. Output format:
+
+## Incremental Code Review
+
+### High (Must Fix)
 - [ ] `<ID>`: <short finding>
 
-### Still Open
+### Medium
+- [ ] `<ID>`: <short finding>
+
+### Low (Optional)
+- [ ] `<ID>`: <short finding>
+
+### Still Open from Previous Review
 - [ ] `<ID>`: <short finding>
 
 ### Resolved Since Last Review
 - [x] `<ID>`
 
-If no actionable issues remain, write exactly:
+When no High/Medium findings remain, include exactly:
 `No blocking issues in this revision.`
 
-Publishing behavior:
-- If `--comment` is NOT provided: print results and stop.
-- If `--comment` is provided:
-  1. Include markers at end of comment:
+10. Publishing behavior:
+ - If `--comment` is NOT provided: print results and stop.
+ - If `--comment` is provided:
+   - Use one sticky summary comment only.
+   - Include markers:
      - `<!-- steno-claude-review -->`
      - `<!-- steno-claude-review-head:<HEAD_SHA> -->`
-  2. If prior marker comment exists, edit it in place via `gh api`.
-  3. Else create one PR comment.
+   - If marker comment exists, update it in place (prefer `mcp__github_comment__update_claude_comment`; fallback to `gh api` edit).
+   - Else create one comment.
 
-Do not post inline comments unless explicitly requested.
-Do not create multiple summary comments when marker comment exists.
+11. Comment hygiene:
+ - Do not post inline comments unless explicitly requested.
+ - Do not create multiple summary comments when a marker comment already exists.
+ - Keep findings concise, actionable, and tied to exact file/line.
+
+False-positive guardrails (never flag):
+- Pre-existing issues not introduced by current changes.
+- Speculative concerns requiring assumptions about unknown runtime state.
+- Style-only preferences.
+- Issues that are explicitly allowed/silenced by scoped CLAUDE.md rules.
